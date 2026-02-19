@@ -1,0 +1,28 @@
+[package]
+name = "nexus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "nexus"
+path = "src/main.rs"
+
+[dependencies]
+nexus-error = { path = "../core-error" }
+nexus-domain = { path = "../core-domain" }
+nexus-messaging = { path = "../mod-messaging" }
+nexus-tdlib = { path = "../infra-tdlib" }
+nexus-google = { path = "../infra-google" }
+nexus-whatsapp = { path = "../infra-whatsapp" }
+nexus-slack = { path = "../infra-slack" }
+nexus-discord = { path = "../infra-discord" }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

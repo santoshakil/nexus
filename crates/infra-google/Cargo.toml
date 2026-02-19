@@ -1,0 +1,23 @@
+[package]
+name = "nexus-google"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+nexus-error = { path = "../core-error" }
+nexus-domain = { path = "../core-domain" }
+async-trait.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+imap.workspace = true
+imap-proto.workspace = true
+native-tls.workspace = true
+lettre.workspace = true
+mailparse.workspace = true
+
+[lints]
+workspace = true

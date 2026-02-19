@@ -1,0 +1,58 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core-error",
+    "crates/core-domain",
+    "crates/mod-messaging",
+    "crates/infra-tdlib",
+    "crates/infra-google",
+    "crates/infra-whatsapp",
+    "crates/infra-slack",
+    "crates/infra-discord",
+    "crates/app-mcp",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.75"
+
+[workspace.dependencies]
+tokio = { version = "1.48", features = ["full"] }
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+imap = "2.4"
+imap-proto = "0.10"
+native-tls = "0.2"
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1-native-tls", "builder", "hostname"] }
+mailparse = "0.15"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls"] }
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+dbg_macro = "warn"
