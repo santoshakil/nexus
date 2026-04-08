@@ -10,6 +10,15 @@ pub fn available_tools(
     has_discord: bool,
 ) -> Vec<ToolDef> {
     let mut tools = universal_tools();
+    tools.extend(health_tools());
+    tools.extend(batch_tools());
+    let platform_count = [has_telegram, has_gmail, has_whatsapp, has_slack, has_discord]
+        .iter()
+        .filter(|&&v| v)
+        .count();
+    if platform_count >= 2 {
+        tools.extend(cross_platform_tools());
+    }
     if has_telegram {
         tools.extend(telegram_tools());
     }
@@ -132,7 +141,7 @@ fn universal_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "search",
-            description: "Search messages across a platform. For Telegram: searches all chats by text content. For Gmail: uses IMAP search syntax — simple text searches the body, or use IMAP criteria like 'FROM sender@example.com', 'SUBJECT keyword', 'SINCE 01-Jan-2025'. For Slack: searches across workspace. For Discord: searches across guild.",
+            description: "Search messages across a platform. For Telegram: searches all chats by text content. For Gmail: searches All Mail by default. Use 'in:folder query' to search a specific folder (in:inbox, in:sent, in:drafts, in:spam, in:trash, in:starred). Also supports IMAP criteria: 'FROM sender@example.com', 'SUBJECT keyword', 'SINCE 01-Jan-2025'. For Slack: searches across workspace. For Discord: searches across guild.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -152,6 +161,92 @@ fn universal_tools() -> Vec<ToolDef> {
                     "format": format_param()
                 },
                 "required": ["platform", "query"]
+            }),
+        },
+    ]
+}
+
+fn health_tools() -> Vec<ToolDef> {
+    vec![
+        ToolDef {
+            name: "health_check",
+            description: "Check the connection health of all connected platforms. Pings each platform's API and reports status (ok/error) and response time. Useful for diagnosing connectivity issues.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
+            }),
+        },
+        ToolDef {
+            name: "unread_summary",
+            description: "Get a summary of unread messages across ALL connected platforms in one call. Shows channels with unread messages and their counts. Ideal for morning triage or checking what needs attention. For Gmail, shows unread inbox count. For Telegram, shows chats with unread messages. For Slack/Discord, shows channels with activity.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max channels to check per platform (default: 20)"
+                    }
+                }
+            }),
+        },
+    ]
+}
+
+fn batch_tools() -> Vec<ToolDef> {
+    vec![
+        ToolDef {
+            name: "read_multiple",
+            description: "Read latest messages from multiple channels on the same platform in a single call. Saves round trips vs calling read_messages multiple times. Returns results grouped by channel.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "platform": platform_param(),
+                    "channels": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of channel names/IDs to read from"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max messages per channel (default: 5)"
+                    },
+                    "format": format_param()
+                },
+                "required": ["platform", "channels"]
+            }),
+        },
+    ]
+}
+
+fn cross_platform_tools() -> Vec<ToolDef> {
+    vec![
+        ToolDef {
+            name: "forward_cross_platform",
+            description: "Forward a message from one platform to another. Reads the message from the source platform and sends its text content to the destination. Works across any combination of connected platforms (e.g. Telegram->Discord, Gmail->Slack, etc.).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "from_platform": platform_param(),
+                    "from_channel": {
+                        "type": "string",
+                        "description": "Source channel/chat ID or name"
+                    },
+                    "message_id": {
+                        "type": "string",
+                        "description": "Message ID to forward from the source platform"
+                    },
+                    "to_platform": platform_param(),
+                    "to_channel": {
+                        "type": "string",
+                        "description": "Destination channel/chat ID or name"
+                    },
+                    "prefix": {
+                        "type": "string",
+                        "description": "Optional prefix to add before the forwarded message (e.g. 'Forwarded from Telegram:')"
+                    },
+                    "format": format_param()
+                },
+                "required": ["from_platform", "from_channel", "message_id", "to_platform", "to_channel"]
             }),
         },
     ]
@@ -405,6 +500,69 @@ fn telegram_tools() -> Vec<ToolDef> {
                     "format": format_param()
                 },
                 "required": ["chat", "query"]
+            }),
+        },
+        ToolDef {
+            name: "telegram_send_typing",
+            description: "Send a typing indicator to a Telegram chat. The indicator disappears after a few seconds or when a message is sent. Useful for signaling the agent is working on a response.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "chat": { "type": "string", "description": "Chat name, @username, or ID" }
+                },
+                "required": ["chat"]
+            }),
+        },
+        ToolDef {
+            name: "telegram_create_group",
+            description: "Create a new Telegram basic group chat with specified members.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "description": "Group title" },
+                    "user_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "User IDs to add to the group"
+                    },
+                    "format": format_param()
+                },
+                "required": ["title", "user_ids"]
+            }),
+        },
+        ToolDef {
+            name: "telegram_add_member",
+            description: "Add a user to a Telegram group by user ID.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "chat": { "type": "string", "description": "Chat name, @username, or ID" },
+                    "user_id": { "type": "integer", "description": "User ID to add" }
+                },
+                "required": ["chat", "user_id"]
+            }),
+        },
+        ToolDef {
+            name: "telegram_leave_chat",
+            description: "Leave a Telegram group or channel.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "chat": { "type": "string", "description": "Chat name, @username, or ID" }
+                },
+                "required": ["chat"]
+            }),
+        },
+        ToolDef {
+            name: "telegram_set_chat_title",
+            description: "Change the title of a Telegram group or channel (requires admin permissions).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "chat": { "type": "string", "description": "Chat name, @username, or ID" },
+                    "title": { "type": "string", "description": "New chat title" }
+                },
+                "required": ["chat", "title"]
             }),
         },
         ToolDef {
@@ -841,6 +999,46 @@ fn slack_tools() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
+            name: "slack_edit_message",
+            description: "Edit a message in a Slack channel. The bot must be the author of the message.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "channel": { "type": "string", "description": "Channel ID" },
+                    "message_ts": { "type": "string", "description": "Message timestamp (ts) to edit" },
+                    "text": { "type": "string", "description": "New message text" },
+                    "format": format_param()
+                },
+                "required": ["channel", "message_ts", "text"]
+            }),
+        },
+        ToolDef {
+            name: "slack_delete_message",
+            description: "Delete a message from a Slack channel. Bot can delete its own messages or others' with appropriate permissions.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "channel": { "type": "string", "description": "Channel ID" },
+                    "message_ts": { "type": "string", "description": "Message timestamp (ts) to delete" }
+                },
+                "required": ["channel", "message_ts"]
+            }),
+        },
+        ToolDef {
+            name: "slack_read_thread",
+            description: "Read replies in a Slack thread. Returns all messages in the thread including the parent message.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "channel": { "type": "string", "description": "Channel ID containing the thread" },
+                    "thread_ts": { "type": "string", "description": "Timestamp of the parent message (thread root)" },
+                    "limit": { "type": "integer", "description": "Max replies to return (default: 50)" },
+                    "format": format_param()
+                },
+                "required": ["channel", "thread_ts"]
+            }),
+        },
+        ToolDef {
             name: "slack_list_users",
             description: "List users in the Slack workspace. Returns names, usernames, roles, and IDs.",
             input_schema: json!({
@@ -964,6 +1162,72 @@ fn discord_tools() -> Vec<ToolDef> {
                     }
                 },
                 "required": ["channel", "message_id", "emoji"]
+            }),
+        },
+        ToolDef {
+            name: "discord_get_message",
+            description: "Get a single message by ID from a Discord channel with full metadata.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "channel": { "type": "string", "description": "Channel ID" },
+                    "message_id": { "type": "string", "description": "Message ID" },
+                    "format": format_param()
+                },
+                "required": ["channel", "message_id"]
+            }),
+        },
+        ToolDef {
+            name: "discord_edit_message",
+            description: "Edit a message sent by the bot in a Discord channel. Only the bot's own messages can be edited.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "channel": { "type": "string", "description": "Channel ID" },
+                    "message_id": { "type": "string", "description": "Message ID to edit" },
+                    "text": { "type": "string", "description": "New message content" },
+                    "format": format_param()
+                },
+                "required": ["channel", "message_id", "text"]
+            }),
+        },
+        ToolDef {
+            name: "discord_delete_message",
+            description: "Delete a message from a Discord channel. Can delete bot's own messages or others' if the bot has Manage Messages permission.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "channel": { "type": "string", "description": "Channel ID" },
+                    "message_id": { "type": "string", "description": "Message ID to delete" }
+                },
+                "required": ["channel", "message_id"]
+            }),
+        },
+        ToolDef {
+            name: "discord_search_guild",
+            description: "Search messages in a specific Discord server (guild). Unlike the universal search which only checks the first guild, this lets you target any guild by ID. Use discord_list_guilds to find guild IDs.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "guild_id": {
+                        "type": "string",
+                        "description": "Discord guild/server ID to search in"
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Search text"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max results (default: 20, max: 100)"
+                    },
+                    "cursor": {
+                        "type": "string",
+                        "description": "Pagination cursor from previous response"
+                    },
+                    "format": format_param()
+                },
+                "required": ["guild_id", "query"]
             }),
         },
         ToolDef {

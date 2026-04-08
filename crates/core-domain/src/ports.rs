@@ -99,6 +99,20 @@ pub trait TelegramExt: MessagingPort {
         chat: &str,
         limit: usize,
     ) -> Result<Vec<ChatMember>, AgentError>;
+
+    async fn create_group(
+        &self,
+        title: &str,
+        user_ids: &[i64],
+    ) -> Result<ChatInfo, AgentError>;
+
+    async fn add_member(&self, chat: &str, user_id: i64) -> Result<(), AgentError>;
+
+    async fn leave_chat(&self, chat: &str) -> Result<(), AgentError>;
+
+    async fn set_chat_title(&self, chat: &str, title: &str) -> Result<(), AgentError>;
+
+    async fn send_typing(&self, chat: &str) -> Result<(), AgentError>;
 }
 
 #[async_trait]
@@ -202,6 +216,22 @@ pub trait SlackExt: MessagingPort {
     async fn list_users(&self, limit: usize) -> Result<Vec<ChatMember>, AgentError>;
 
     async fn get_user_info(&self, user: &str) -> Result<Profile, AgentError>;
+
+    async fn edit_message(
+        &self,
+        channel: &str,
+        msg_ts: &str,
+        text: &str,
+    ) -> Result<Message, AgentError>;
+
+    async fn delete_message(&self, channel: &str, msg_ts: &str) -> Result<(), AgentError>;
+
+    async fn read_thread(
+        &self,
+        channel: &str,
+        thread_ts: &str,
+        limit: usize,
+    ) -> Result<Vec<Message>, AgentError>;
 }
 
 #[async_trait]
@@ -235,4 +265,23 @@ pub trait DiscordExt: MessagingPort {
     ) -> Result<(), AgentError>;
 
     async fn pin_message(&self, channel: &str, msg_id: &str) -> Result<(), AgentError>;
+
+    async fn edit_message(
+        &self,
+        channel: &str,
+        msg_id: &str,
+        text: &str,
+    ) -> Result<Message, AgentError>;
+
+    async fn delete_message(&self, channel: &str, msg_id: &str) -> Result<(), AgentError>;
+
+    async fn get_message(&self, channel: &str, msg_id: &str) -> Result<Message, AgentError>;
+
+    async fn search_guild(
+        &self,
+        guild_id: &str,
+        query: &str,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<Paginated<Message>, AgentError>;
 }

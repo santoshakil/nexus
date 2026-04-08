@@ -1165,6 +1165,81 @@ impl TelegramExt for TdlibAdapter {
             )),
         }
     }
+
+    async fn create_group(
+        &self,
+        title: &str,
+        user_ids: &[i64],
+    ) -> Result<ChatInfo, AgentError> {
+        let resp = self
+            .client
+            .send(json!({
+                "@type": "createNewBasicGroupChat",
+                "user_ids": user_ids,
+                "title": title,
+            }))
+            .await?;
+
+        let chat_id = resp.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+        self.get_chat_info(&chat_id.to_string()).await
+    }
+
+    async fn add_member(&self, chat: &str, user_id: i64) -> Result<(), AgentError> {
+        let chat_id = self.resolve_chat_id(chat).await?;
+
+        self.client
+            .send(json!({
+                "@type": "addChatMember",
+                "chat_id": chat_id,
+                "user_id": user_id,
+            }))
+            .await?;
+
+        Ok(())
+    }
+
+    async fn leave_chat(&self, chat: &str) -> Result<(), AgentError> {
+        let chat_id = self.resolve_chat_id(chat).await?;
+
+        self.client
+            .send(json!({
+                "@type": "leaveChat",
+                "chat_id": chat_id,
+            }))
+            .await?;
+
+        Ok(())
+    }
+
+    async fn set_chat_title(&self, chat: &str, title: &str) -> Result<(), AgentError> {
+        let chat_id = self.resolve_chat_id(chat).await?;
+
+        self.client
+            .send(json!({
+                "@type": "setChatTitle",
+                "chat_id": chat_id,
+                "title": title,
+            }))
+            .await?;
+
+        Ok(())
+    }
+
+    async fn send_typing(&self, chat: &str) -> Result<(), AgentError> {
+        let chat_id = self.resolve_chat_id(chat).await?;
+
+        self.client
+            .send(json!({
+                "@type": "sendChatAction",
+                "chat_id": chat_id,
+                "action": {
+                    "@type": "chatActionTyping",
+                },
+            }))
+            .await?;
+
+        Ok(())
+    }
 }
 
 fn extract_file_id(msg: &Value) -> Option<i64> {

@@ -1,9 +1,11 @@
+use std::time::Duration;
+
 use async_trait::async_trait;
 use nexus_domain::*;
 use nexus_error::AgentError;
 use reqwest::Client;
 use serde_json::Value;
-use tracing::debug;
+use tracing::{debug, warn};
 
 const BASE_URL: &str = "https://discord.com/api/v10";
 
@@ -23,6 +25,55 @@ impl DiscordAdapter {
         Self { auth, client }
     }
 
+    async fn search_guild_impl(
+        &self,
+        guild_id: &str,
+        query: &str,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<Paginated<Message>, AgentError> {
+        Self::validate_id(guild_id, "guild_id")?;
+        let offset: usize = cursor
+            .and_then(|c| c.strip_prefix("dc:"))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
+        let path = format!(
+            "/guilds/{guild_id}/messages/search?content={}&limit={}&offset={}",
+            urlencoding(query),
+            limit,
+            offset,
+        );
+
+        let resp = self.api_get(&path).await?;
+        let messages: Vec<Message> = resp["messages"]
+            .as_array()
+            .map_or(&[] as &[Value], |v| v)
+            .iter()
+            .filter_map(|arr| arr.as_array().and_then(|a| a.first()))
+            .map(|m| {
+                let ch_id = m["channel_id"].as_str().unwrap_or("");
+                parse_discord_message(m, ch_id)
+            })
+            .collect();
+
+        let total = resp["total_results"].as_u64().unwrap_or(0) as usize;
+        let next_offset = offset + messages.len();
+        let has_more = next_offset < total;
+
+        let next_cursor = if has_more {
+            Some(format!("dc:{next_offset}"))
+        } else {
+            None
+        };
+
+        Ok(Paginated {
+            items: messages,
+            has_more,
+            next_cursor,
+        })
+    }
+
     fn validate_id(id: &str, label: &str) -> Result<(), AgentError> {
         if id.is_empty() || id.contains('/') || id.contains('\\') || id.contains('\0') {
             return Err(AgentError::invalid_input(format!(
@@ -35,26 +86,39 @@ impl DiscordAdapter {
     async fn api_get(&self, path: &str) -> Result<serde_json::Value, AgentError> {
         let url = format!("{BASE_URL}{path}");
         debug!(url, "discord GET");
-        let resp = self
-            .client
-            .get(&url)
-            .header("Authorization", &self.auth)
-            .send()
-            .await
-            .map_err(|e| AgentError::network(format!("discord request failed: {e}")))?;
 
-        let status = resp.status();
-        let body: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| AgentError::api(format!("discord response parse failed: {e}")))?;
+        for attempt in 0..3 {
+            let resp = self
+                .client
+                .get(&url)
+                .header("Authorization", &self.auth)
+                .send()
+                .await
+                .map_err(|e| AgentError::network(format!("discord request failed: {e}")))?;
 
-        if !status.is_success() {
-            let msg = body["message"].as_str().unwrap_or("unknown error");
-            return Err(parse_discord_error(status.as_u16(), msg));
+            if resp.status().as_u16() == 429 {
+                if let Some(delay) = parse_retry_after(&resp) {
+                    warn!(attempt, delay_ms = delay.as_millis() as u64, "discord rate limited, retrying");
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+            }
+
+            let status = resp.status();
+            let body: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| AgentError::api(format!("discord response parse failed: {e}")))?;
+
+            if !status.is_success() {
+                let msg = body["message"].as_str().unwrap_or("unknown error");
+                return Err(parse_discord_error(status.as_u16(), msg));
+            }
+
+            return Ok(body);
         }
 
-        Ok(body)
+        Err(AgentError::api("discord rate limited after 3 retries"))
     }
 
     async fn api_post(
@@ -64,76 +128,158 @@ impl DiscordAdapter {
     ) -> Result<serde_json::Value, AgentError> {
         let url = format!("{BASE_URL}{path}");
         debug!(url, "discord POST");
-        let resp = self
-            .client
-            .post(&url)
-            .header("Authorization", &self.auth)
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| AgentError::network(format!("discord request failed: {e}")))?;
 
-        let status = resp.status();
-        let response_body: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| AgentError::api(format!("discord response parse failed: {e}")))?;
+        for attempt in 0..3 {
+            let resp = self
+                .client
+                .post(&url)
+                .header("Authorization", &self.auth)
+                .json(body)
+                .send()
+                .await
+                .map_err(|e| AgentError::network(format!("discord request failed: {e}")))?;
 
-        if !status.is_success() {
-            let msg = response_body["message"].as_str().unwrap_or("unknown error");
-            return Err(parse_discord_error(status.as_u16(), msg));
+            if resp.status().as_u16() == 429 {
+                if let Some(delay) = parse_retry_after(&resp) {
+                    warn!(attempt, delay_ms = delay.as_millis() as u64, "discord rate limited, retrying");
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+            }
+
+            let status = resp.status();
+            let response_body: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| AgentError::api(format!("discord response parse failed: {e}")))?;
+
+            if !status.is_success() {
+                let msg = response_body["message"].as_str().unwrap_or("unknown error");
+                return Err(parse_discord_error(status.as_u16(), msg));
+            }
+
+            return Ok(response_body);
         }
 
-        Ok(response_body)
+        Err(AgentError::api("discord rate limited after 3 retries"))
+    }
+
+    async fn api_patch(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, AgentError> {
+        let url = format!("{BASE_URL}{path}");
+        debug!(url, "discord PATCH");
+
+        for attempt in 0..3 {
+            let resp = self
+                .client
+                .patch(&url)
+                .header("Authorization", &self.auth)
+                .json(body)
+                .send()
+                .await
+                .map_err(|e| AgentError::network(format!("discord request failed: {e}")))?;
+
+            if resp.status().as_u16() == 429 {
+                if let Some(delay) = parse_retry_after(&resp) {
+                    warn!(attempt, delay_ms = delay.as_millis() as u64, "discord rate limited, retrying");
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+            }
+
+            let status = resp.status();
+            let response_body: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| AgentError::api(format!("discord response parse failed: {e}")))?;
+
+            if !status.is_success() {
+                let msg = response_body["message"].as_str().unwrap_or("unknown error");
+                return Err(parse_discord_error(status.as_u16(), msg));
+            }
+
+            return Ok(response_body);
+        }
+
+        Err(AgentError::api("discord rate limited after 3 retries"))
     }
 
     async fn api_put_empty(&self, path: &str) -> Result<(), AgentError> {
         let url = format!("{BASE_URL}{path}");
         debug!(url, "discord PUT");
-        let resp = self
-            .client
-            .put(&url)
-            .header("Authorization", &self.auth)
-            .header("Content-Length", "0")
-            .send()
-            .await
-            .map_err(|e| AgentError::network(format!("discord request failed: {e}")))?;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let body: serde_json::Value = resp
-                .json()
+        for attempt in 0..3 {
+            let resp = self
+                .client
+                .put(&url)
+                .header("Authorization", &self.auth)
+                .header("Content-Length", "0")
+                .send()
                 .await
-                .unwrap_or(serde_json::json!({"message": "unknown error"}));
-            let msg = body["message"].as_str().unwrap_or("unknown error");
-            return Err(parse_discord_error(status.as_u16(), msg));
+                .map_err(|e| AgentError::network(format!("discord request failed: {e}")))?;
+
+            if resp.status().as_u16() == 429 {
+                if let Some(delay) = parse_retry_after(&resp) {
+                    warn!(attempt, delay_ms = delay.as_millis() as u64, "discord rate limited, retrying");
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+            }
+
+            let status = resp.status();
+            if !status.is_success() {
+                let body: serde_json::Value = resp
+                    .json()
+                    .await
+                    .unwrap_or(serde_json::json!({"message": "unknown error"}));
+                let msg = body["message"].as_str().unwrap_or("unknown error");
+                return Err(parse_discord_error(status.as_u16(), msg));
+            }
+
+            return Ok(());
         }
 
-        Ok(())
+        Err(AgentError::api("discord rate limited after 3 retries"))
     }
 
     async fn api_delete(&self, path: &str) -> Result<(), AgentError> {
         let url = format!("{BASE_URL}{path}");
         debug!(url, "discord DELETE");
-        let resp = self
-            .client
-            .delete(&url)
-            .header("Authorization", &self.auth)
-            .send()
-            .await
-            .map_err(|e| AgentError::network(format!("discord request failed: {e}")))?;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let body: serde_json::Value = resp
-                .json()
+        for attempt in 0..3 {
+            let resp = self
+                .client
+                .delete(&url)
+                .header("Authorization", &self.auth)
+                .send()
                 .await
-                .unwrap_or(serde_json::json!({"message": "unknown error"}));
-            let msg = body["message"].as_str().unwrap_or("unknown error");
-            return Err(parse_discord_error(status.as_u16(), msg));
+                .map_err(|e| AgentError::network(format!("discord request failed: {e}")))?;
+
+            if resp.status().as_u16() == 429 {
+                if let Some(delay) = parse_retry_after(&resp) {
+                    warn!(attempt, delay_ms = delay.as_millis() as u64, "discord rate limited, retrying");
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+            }
+
+            let status = resp.status();
+            if !status.is_success() {
+                let body: serde_json::Value = resp
+                    .json()
+                    .await
+                    .unwrap_or(serde_json::json!({"message": "unknown error"}));
+                let msg = body["message"].as_str().unwrap_or("unknown error");
+                return Err(parse_discord_error(status.as_u16(), msg));
+            }
+
+            return Ok(());
         }
 
-        Ok(())
+        Err(AgentError::api("discord rate limited after 3 retries"))
     }
 }
 
@@ -262,47 +408,9 @@ impl MessagingPort for DiscordAdapter {
             .as_array()
             .and_then(|a| a.first())
             .and_then(|g| g["id"].as_str())
-            .ok_or_else(|| AgentError::not_found("no guilds found for search (searches first guild only)"))?;
+            .ok_or_else(|| AgentError::not_found("no guilds found. Use discord_search_guild with a specific guild_id"))?;
 
-        let offset: usize = cursor
-            .and_then(|c| c.strip_prefix("dc:"))
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-
-        let path = format!(
-            "/guilds/{first_guild_id}/messages/search?content={}&limit={}&offset={}",
-            urlencoding(query),
-            limit,
-            offset,
-        );
-
-        let resp = self.api_get(&path).await?;
-        let messages: Vec<Message> = resp["messages"]
-            .as_array()
-            .map_or(&[] as &[Value], |v| v)
-            .iter()
-            .filter_map(|arr| arr.as_array().and_then(|a| a.first()))
-            .map(|m| {
-                let ch_id = m["channel_id"].as_str().unwrap_or("");
-                parse_discord_message(m, ch_id)
-            })
-            .collect();
-
-        let total = resp["total_results"].as_u64().unwrap_or(0) as usize;
-        let next_offset = offset + messages.len();
-        let has_more = next_offset < total;
-
-        let next_cursor = if has_more {
-            Some(format!("dc:{next_offset}"))
-        } else {
-            None
-        };
-
-        Ok(Paginated {
-            items: messages,
-            has_more,
-            next_cursor,
-        })
+        self.search_guild_impl(first_guild_id, query, limit, cursor).await
     }
 }
 
@@ -415,6 +523,49 @@ impl DiscordExt for DiscordAdapter {
         self.api_put_empty(&format!("/channels/{channel}/pins/{msg_id}"))
             .await
     }
+
+    async fn edit_message(
+        &self,
+        channel: &str,
+        msg_id: &str,
+        text: &str,
+    ) -> Result<Message, AgentError> {
+        Self::validate_id(channel, "channel")?;
+        Self::validate_id(msg_id, "message_id")?;
+        let resp = self
+            .api_patch(
+                &format!("/channels/{channel}/messages/{msg_id}"),
+                &serde_json::json!({ "content": text }),
+            )
+            .await?;
+        Ok(parse_discord_message(&resp, channel))
+    }
+
+    async fn delete_message(&self, channel: &str, msg_id: &str) -> Result<(), AgentError> {
+        Self::validate_id(channel, "channel")?;
+        Self::validate_id(msg_id, "message_id")?;
+        self.api_delete(&format!("/channels/{channel}/messages/{msg_id}"))
+            .await
+    }
+
+    async fn get_message(&self, channel: &str, msg_id: &str) -> Result<Message, AgentError> {
+        Self::validate_id(channel, "channel")?;
+        Self::validate_id(msg_id, "message_id")?;
+        let resp = self
+            .api_get(&format!("/channels/{channel}/messages/{msg_id}"))
+            .await?;
+        Ok(parse_discord_message(&resp, channel))
+    }
+
+    async fn search_guild(
+        &self,
+        guild_id: &str,
+        query: &str,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<Paginated<Message>, AgentError> {
+        self.search_guild_impl(guild_id, query, limit, cursor).await
+    }
 }
 
 fn parse_discord_channel(ch: &serde_json::Value, guild_name: &str) -> Channel {
@@ -498,6 +649,17 @@ fn parse_discord_error(status: u16, msg: &str) -> AgentError {
         return AgentError::auth(format!("discord auth failed ({status}): {msg}"));
     }
     AgentError::api(format!("discord api error ({status}): {msg}"))
+}
+
+fn parse_retry_after(resp: &reqwest::Response) -> Option<Duration> {
+    let secs: f64 = resp
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1.0);
+    let ms = (secs * 1000.0).min(30_000.0) as u64;
+    Some(Duration::from_millis(ms.max(100)))
 }
 
 fn urlencoding(s: &str) -> String {

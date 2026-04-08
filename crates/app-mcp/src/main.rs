@@ -9,7 +9,7 @@ use nexus_messaging::AgentService;
 use nexus_slack::{SlackAdapter, SlackConfig};
 use nexus_tdlib::{AuthConfig, TdClient, TdlibAdapter};
 use nexus_whatsapp::{WhatsAppAdapter, WhatsAppConfig};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 fn init_tracing() {
     tracing_subscriber::fmt()
@@ -130,16 +130,27 @@ async fn run_mcp_server() -> Result<(), Box<dyn std::error::Error>> {
     let telegram = match load_telegram_config() {
         Ok(cfg) => {
             let client = Arc::new(TdClient::new());
-            let mut auth_rx = client
-                .take_auth_rx()
-                .ok_or("failed to get auth receiver")?;
-
-            nexus_tdlib::auth::wait_for_ready(&client, &mut auth_rx, &cfg).await?;
-            info!("telegram connected");
-
-            let adapter = Arc::new(TdlibAdapter::new(client));
-            agent.register(adapter.clone());
-            Some(adapter)
+            let auth_rx = client.take_auth_rx();
+            match auth_rx {
+                Some(mut rx) => {
+                    match nexus_tdlib::auth::wait_for_ready(&client, &mut rx, &cfg).await {
+                        Ok(()) => {
+                            info!("telegram connected");
+                            let adapter = Arc::new(TdlibAdapter::new(client));
+                            agent.register(adapter.clone());
+                            Some(adapter)
+                        }
+                        Err(e) => {
+                            warn!("telegram auth failed (run `nexus auth telegram`): {e}");
+                            None
+                        }
+                    }
+                }
+                None => {
+                    warn!("telegram: failed to get auth receiver");
+                    None
+                }
+            }
         }
         Err(e) => {
             info!("telegram not configured: {e}");

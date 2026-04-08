@@ -136,3 +136,105 @@ impl ErrorResponse {
         parts.join(" | ")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_display_messages() {
+        assert_eq!(
+            AgentError::auth("bad token").to_string(),
+            "authentication failed: bad token"
+        );
+        assert_eq!(
+            AgentError::not_found("chat xyz").to_string(),
+            "not found: chat xyz"
+        );
+        assert_eq!(
+            AgentError::network("timeout").to_string(),
+            "network error: timeout"
+        );
+    }
+
+    #[test]
+    fn error_response_mapping() {
+        let err = AgentError::auth("expired");
+        let resp = ErrorResponse::from(&err);
+        assert_eq!(resp.code, "AUTH_ERROR");
+        assert!(!resp.retryable);
+        assert!(resp.suggestion.is_some());
+    }
+
+    #[test]
+    fn network_error_is_retryable() {
+        let err = AgentError::network("connection reset");
+        let resp = ErrorResponse::from(&err);
+        assert!(resp.retryable);
+        assert_eq!(resp.code, "NETWORK_ERROR");
+    }
+
+    #[test]
+    fn internal_error_is_retryable() {
+        let err = AgentError::internal("panic");
+        let resp = ErrorResponse::from(&err);
+        assert!(resp.retryable);
+        assert_eq!(resp.code, "INTERNAL_ERROR");
+    }
+
+    #[test]
+    fn non_retryable_errors() {
+        for err in [
+            AgentError::api("bad request"),
+            AgentError::session("expired"),
+            AgentError::not_found("x"),
+            AgentError::invalid_input("y"),
+            AgentError::platform_not_available("z"),
+            AgentError::not_implemented("w"),
+        ] {
+            let resp = ErrorResponse::from(&err);
+            assert!(!resp.retryable, "expected non-retryable for {}", resp.code);
+        }
+    }
+
+    #[test]
+    fn compact_format_with_suggestion() {
+        let err = AgentError::auth("token expired");
+        let resp = ErrorResponse::from(&err);
+        let compact = resp.to_compact();
+        assert!(compact.contains("[AUTH_ERROR]"));
+        assert!(compact.contains("token expired"));
+        assert!(compact.contains("Suggestion:"));
+        assert!(!compact.contains("(retryable)"));
+    }
+
+    #[test]
+    fn compact_format_retryable() {
+        let err = AgentError::network("reset");
+        let resp = ErrorResponse::from(&err);
+        let compact = resp.to_compact();
+        assert!(compact.contains("(retryable)"));
+    }
+
+    #[test]
+    fn constructor_helpers() {
+        let e = AgentError::auth("x");
+        assert!(matches!(e, AgentError::Auth(_)));
+        let e = AgentError::api("x");
+        assert!(matches!(e, AgentError::Api(_)));
+        let e = AgentError::network("x");
+        assert!(matches!(e, AgentError::Network(_)));
+        let e = AgentError::session("x");
+        assert!(matches!(e, AgentError::Session(_)));
+        let e = AgentError::not_found("x");
+        assert!(matches!(e, AgentError::NotFound(_)));
+        let e = AgentError::invalid_input("x");
+        assert!(matches!(e, AgentError::InvalidInput(_)));
+        let e = AgentError::platform_not_available("x");
+        assert!(matches!(e, AgentError::PlatformNotAvailable(_)));
+        let e = AgentError::not_implemented("x");
+        assert!(matches!(e, AgentError::NotImplemented(_)));
+        let e = AgentError::internal("x");
+        assert!(matches!(e, AgentError::Internal(_)));
+    }
+}

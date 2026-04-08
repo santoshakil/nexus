@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use nexus_domain::*;
 use nexus_error::ErrorResponse;
@@ -222,8 +223,119 @@ impl McpServer {
             }
             "list_platforms" => {
                 let platforms = self.agent.available_platforms();
-                let lines: Vec<String> = platforms.iter().map(|p| p.to_string()).collect();
-                Ok(format!("Connected platforms: {}", lines.join(", ")))
+                let mut lines: Vec<String> = Vec::with_capacity(platforms.len());
+                for p in &platforms {
+                    let name = match self.agent.get_profile(*p).await {
+                        Ok(profile) => {
+                            let user = profile.username
+                                .map(|u| format!(" (@{u})"))
+                                .unwrap_or_default();
+                            format!("  {p}: {}{user}", profile.name)
+                        }
+                        Err(_) => format!("  {p}: connected"),
+                    };
+                    lines.push(name);
+                }
+                Ok(format!("{} connected platforms:\n{}", platforms.len(), lines.join("\n")))
+            }
+            "read_multiple" => {
+                let p = parse_platform(args)?;
+                let channels = get_str_array(args, "channels")?;
+                let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+                let mut sections: Vec<String> = Vec::with_capacity(channels.len());
+
+                for ch in &channels {
+                    match self.agent.read_messages(p, ch, limit, None).await {
+                        Ok(result) => {
+                            let header = format!("--- {} ({} messages) ---", ch, result.items.len());
+                            let body = format::format_paginated(&result, fmt);
+                            sections.push(format!("{header}\n{body}"));
+                        }
+                        Err(e) => {
+                            sections.push(format!("--- {} (error: {e}) ---", ch));
+                        }
+                    }
+                }
+
+                Ok(sections.join("\n\n"))
+            }
+            "unread_summary" => {
+                let platforms = self.agent.available_platforms();
+                let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+                let mut sections: Vec<String> = Vec::new();
+                let mut total_unread = 0u32;
+
+                for p in &platforms {
+                    match self.agent.list_channels(*p, limit).await {
+                        Ok(channels) => {
+                            let unread: Vec<&Channel> = channels.iter()
+                                .filter(|c| c.unread_count > 0)
+                                .collect();
+                            if unread.is_empty() {
+                                sections.push(format!("  {p}: no unread"));
+                            } else {
+                                let count: i32 = unread.iter().map(|c| c.unread_count).sum();
+                                total_unread += count as u32;
+                                let mut lines = vec![format!("  {p}: {count} unread in {} channel(s)", unread.len())];
+                                for ch in &unread {
+                                    lines.push(format!("    {} — {} unread", ch.name, ch.unread_count));
+                                }
+                                sections.push(lines.join("\n"));
+                            }
+                        }
+                        Err(e) => {
+                            sections.push(format!("  {p}: error — {e}"));
+                        }
+                    }
+                }
+
+                Ok(format!("Unread summary ({total_unread} total across {} platforms):\n{}", platforms.len(), sections.join("\n")))
+            }
+            "health_check" => {
+                let platforms = self.agent.available_platforms();
+                let mut results: Vec<String> = Vec::with_capacity(platforms.len());
+                for p in &platforms {
+                    let start = Instant::now();
+                    match self.agent.get_profile(*p).await {
+                        Ok(profile) => {
+                            let ms = start.elapsed().as_millis();
+                            results.push(format!("  {p}: ok ({ms}ms) — {}", profile.name));
+                        }
+                        Err(e) => {
+                            let ms = start.elapsed().as_millis();
+                            results.push(format!("  {p}: error ({ms}ms) — {e}"));
+                        }
+                    }
+                }
+                Ok(format!("Health check ({} platforms):\n{}", platforms.len(), results.join("\n")))
+            }
+
+            // --- Cross-platform tools ---
+            "forward_cross_platform" => {
+                let from_p = parse_platform_key(args, "from_platform")?;
+                let from_ch = get_str(args, "from_channel")?;
+                let msg_id = get_str(args, "message_id")?;
+                let to_p = parse_platform_key(args, "to_platform")?;
+                let to_ch = get_str(args, "to_channel")?;
+                let prefix = args.get("prefix").and_then(|v| v.as_str()).unwrap_or("");
+
+                let source = self.agent.read_messages(from_p, from_ch, 50, None)
+                    .await
+                    .map_err(fmt_err)?;
+                let msg = source.items.iter()
+                    .find(|m| m.id == msg_id)
+                    .ok_or_else(|| format!("message {msg_id} not found in {from_ch}"))?;
+
+                let text = if prefix.is_empty() {
+                    format!("[Fwd from {from_p}/{from_ch} by {}] {}", msg.sender, msg.text)
+                } else {
+                    format!("{prefix} {}", msg.text)
+                };
+
+                let sent = self.agent.send_message(to_p, to_ch, &text, None)
+                    .await
+                    .map_err(fmt_err)?;
+                Ok(format::format_message(&sent, fmt))
             }
 
             // --- Telegram tools ---
@@ -333,6 +445,39 @@ impl McpServer {
                     .await
                     .map_err(fmt_err)?;
                 Ok(format::format_messages(&messages, fmt))
+            }
+            "telegram_send_typing" => {
+                let tg = self.require_telegram()?;
+                let chat = get_str(args, "chat")?;
+                tg.send_typing(chat).await.map_err(fmt_err)?;
+                Ok(format!("Sent typing indicator to {chat}"))
+            }
+            "telegram_create_group" => {
+                let tg = self.require_telegram()?;
+                let title = get_str(args, "title")?;
+                let user_ids = get_i64_array(args, "user_ids")?;
+                let info = tg.create_group(title, &user_ids).await.map_err(fmt_err)?;
+                Ok(format::format_chat_info(&info, fmt))
+            }
+            "telegram_add_member" => {
+                let tg = self.require_telegram()?;
+                let chat = get_str(args, "chat")?;
+                let user_id = get_i64(args, "user_id")?;
+                tg.add_member(chat, user_id).await.map_err(fmt_err)?;
+                Ok(format!("Added user {user_id} to {chat}"))
+            }
+            "telegram_leave_chat" => {
+                let tg = self.require_telegram()?;
+                let chat = get_str(args, "chat")?;
+                tg.leave_chat(chat).await.map_err(fmt_err)?;
+                Ok(format!("Left chat {chat}"))
+            }
+            "telegram_set_chat_title" => {
+                let tg = self.require_telegram()?;
+                let chat = get_str(args, "chat")?;
+                let title = get_str(args, "title")?;
+                tg.set_chat_title(chat, title).await.map_err(fmt_err)?;
+                Ok(format!("Set title of {chat} to '{title}'"))
             }
             "telegram_get_chat_members" => {
                 let tg = self.require_telegram()?;
@@ -529,6 +674,29 @@ impl McpServer {
                     .map_err(fmt_err)?;
                 Ok(result)
             }
+            "slack_edit_message" => {
+                let sl = self.require_slack()?;
+                let channel = get_str(args, "channel")?;
+                let msg_ts = get_str(args, "message_ts")?;
+                let text = get_str(args, "text")?;
+                let msg = sl.edit_message(channel, msg_ts, text).await.map_err(fmt_err)?;
+                Ok(format::format_message(&msg, fmt))
+            }
+            "slack_delete_message" => {
+                let sl = self.require_slack()?;
+                let channel = get_str(args, "channel")?;
+                let msg_ts = get_str(args, "message_ts")?;
+                sl.delete_message(channel, msg_ts).await.map_err(fmt_err)?;
+                Ok(format!("Deleted message {msg_ts} from {channel}"))
+            }
+            "slack_read_thread" => {
+                let sl = self.require_slack()?;
+                let channel = get_str(args, "channel")?;
+                let thread_ts = get_str(args, "thread_ts")?;
+                let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+                let messages = sl.read_thread(channel, thread_ts, limit).await.map_err(fmt_err)?;
+                Ok(format::format_messages(&messages, fmt))
+            }
             "slack_list_users" => {
                 let sl = self.require_slack()?;
                 let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
@@ -588,6 +756,40 @@ impl McpServer {
                     .map_err(fmt_err)?;
                 Ok(format!("Removed {emoji} reaction from message {msg_id}"))
             }
+            "discord_get_message" => {
+                let dc = self.require_discord()?;
+                let channel = get_str(args, "channel")?;
+                let msg_id = get_str(args, "message_id")?;
+                let msg = dc.get_message(channel, msg_id).await.map_err(fmt_err)?;
+                Ok(format::format_message(&msg, fmt))
+            }
+            "discord_edit_message" => {
+                let dc = self.require_discord()?;
+                let channel = get_str(args, "channel")?;
+                let msg_id = get_str(args, "message_id")?;
+                let text = get_str(args, "text")?;
+                let msg = dc.edit_message(channel, msg_id, text).await.map_err(fmt_err)?;
+                Ok(format::format_message(&msg, fmt))
+            }
+            "discord_delete_message" => {
+                let dc = self.require_discord()?;
+                let channel = get_str(args, "channel")?;
+                let msg_id = get_str(args, "message_id")?;
+                dc.delete_message(channel, msg_id).await.map_err(fmt_err)?;
+                Ok(format!("Deleted message {msg_id} from channel {channel}"))
+            }
+            "discord_search_guild" => {
+                let dc = self.require_discord()?;
+                let guild_id = get_str(args, "guild_id")?;
+                let query = get_str(args, "query")?;
+                let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+                let cursor = args.get("cursor").and_then(|v| v.as_str());
+                let result = dc
+                    .search_guild(guild_id, query, limit, cursor)
+                    .await
+                    .map_err(fmt_err)?;
+                Ok(format::format_paginated(&result, fmt))
+            }
             "discord_pin_message" => {
                 let dc = self.require_discord()?;
                 let channel = get_str(args, "channel")?;
@@ -642,10 +844,14 @@ fn fmt_err(e: nexus_error::AgentError) -> String {
 }
 
 fn parse_platform(args: &Value) -> Result<Platform, String> {
+    parse_platform_key(args, "platform")
+}
+
+fn parse_platform_key(args: &Value, key: &str) -> Result<Platform, String> {
     let name = args
-        .get("platform")
+        .get(key)
         .and_then(|v| v.as_str())
-        .ok_or("missing 'platform' parameter")?;
+        .ok_or(format!("missing '{key}' parameter"))?;
     name.parse::<Platform>().map_err(|e| e.to_string())
 }
 

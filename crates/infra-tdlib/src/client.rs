@@ -57,12 +57,15 @@ impl TdClient {
         // to avoid blocking tokio worker threads. The thread lives as long as
         // `running` is true. On Drop, we set running=false and the thread exits
         // within 1 second (the td_receive timeout).
-        std::thread::Builder::new()
+        if let Err(e) = std::thread::Builder::new()
             .name("tdlib-recv".into())
             .spawn(move || {
                 receive_loop(pending_clone, auth_tx_clone, running_clone);
             })
-            .ok();
+        {
+            warn!("failed to spawn TDLib receive thread: {e}");
+            running.store(false, Ordering::Relaxed);
+        }
 
         // Kick TDLib's internal processing — managed clients don't start
         // sending updateAuthorizationState until they receive a request.
@@ -91,6 +94,9 @@ impl TdClient {
     }
 
     pub async fn send(&self, mut request: Value) -> Result<Value, AgentError> {
+        if !self.running.load(Ordering::Relaxed) {
+            return Err(AgentError::internal("TDLib client is not running"));
+        }
         let extra = format!("r{}", self.next_id.fetch_add(1, Ordering::Relaxed));
         request["@extra"] = Value::String(extra.clone());
 

@@ -387,11 +387,65 @@ fn imap_find_message(
     Ok(results.into_iter().collect())
 }
 
+fn imap_find_message_in_any_folder(
+    session: &mut ImapSession,
+    message_id: &str,
+) -> Result<(String, Vec<u32>), AgentError> {
+    let folders = [
+        "INBOX",
+        "[Gmail]/All Mail",
+        "[Gmail]/Sent Mail",
+        "[Gmail]/Starred",
+        "[Gmail]/Drafts",
+        "[Gmail]/Important",
+    ];
+
+    for folder in &folders {
+        if session.select(folder).is_err() {
+            continue;
+        }
+        let search_query = format!("HEADER Message-ID \"{message_id}\"");
+        if let Ok(results) = session.search(&search_query) {
+            if !results.is_empty() {
+                return Ok((folder.to_string(), results.into_iter().collect()));
+            }
+        }
+    }
+
+    Err(AgentError::not_found(format!(
+        "message not found in any folder: {message_id}"
+    )))
+}
+
 fn uid_str(uids: &[u32]) -> String {
     uids.iter()
         .map(|u| u.to_string())
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn parse_search_folder(query: &str) -> (String, String) {
+    let lower = query.to_lowercase();
+    if let Some(rest) = lower.strip_prefix("in:") {
+        let (folder_part, remainder) = match rest.find(' ') {
+            Some(idx) => (&rest[..idx], query[3 + idx..].trim().to_string()),
+            None => (rest, "ALL".to_string()),
+        };
+        let folder = match folder_part {
+            "inbox" => "INBOX".to_string(),
+            "sent" => "[Gmail]/Sent Mail".to_string(),
+            "drafts" => "[Gmail]/Drafts".to_string(),
+            "spam" => "[Gmail]/Spam".to_string(),
+            "trash" => "[Gmail]/Trash".to_string(),
+            "starred" => "[Gmail]/Starred".to_string(),
+            "important" => "[Gmail]/Important".to_string(),
+            "all" => "[Gmail]/All Mail".to_string(),
+            other => other.to_string(),
+        };
+        (folder, remainder)
+    } else {
+        ("[Gmail]/All Mail".to_string(), query.to_string())
+    }
 }
 
 fn now_ts() -> i64 {
@@ -538,7 +592,7 @@ impl MessagingPort for GmailAdapter {
         limit: usize,
         cursor: Option<&str>,
     ) -> Result<Paginated<Message>, AgentError> {
-        let query = query.to_string();
+        let (folder, imap_query) = parse_search_folder(query);
         let limit = limit.min(100);
         let cursor_offset = cursor
             .and_then(|c| c.strip_prefix("gm:"))
@@ -547,12 +601,12 @@ impl MessagingPort for GmailAdapter {
 
         self.with_session(move |session| {
             session
-                .select("INBOX")
-                .map_err(|e| AgentError::network(format!("IMAP SELECT INBOX: {e}")))?;
+                .select(&folder)
+                .map_err(|e| AgentError::network(format!("IMAP SELECT {folder}: {e}")))?;
 
-            let sanitized = query.replace(['"', '\\'], "");
+            let sanitized = imap_query.replace(['"', '\\'], "");
             let search_result = session
-                .search(&query)
+                .search(&imap_query)
                 .or_else(|_| {
                     debug!("raw IMAP search failed, trying TEXT search");
                     session.search(format!("TEXT \"{sanitized}\""))
@@ -582,7 +636,7 @@ impl MessagingPort for GmailAdapter {
 
             let mut messages: Vec<Message> = fetches
                 .iter()
-                .filter_map(|f| fetch_to_message(f, "INBOX"))
+                .filter_map(|f| fetch_to_message(f, &folder))
                 .collect();
 
             messages.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
@@ -755,18 +809,19 @@ impl GmailExt for GmailAdapter {
         let thread_id = thread_id.to_string();
 
         self.with_session(move |session| {
-            session
-                .select("INBOX")
-                .map_err(|e| AgentError::network(format!("IMAP SELECT: {e}")))?;
-
-            let uids = imap_find_message(session, &thread_id)?;
+            let (folder, uids) = imap_find_message_in_any_folder(session, &thread_id)?;
             let ids = uid_str(&uids);
+
+            if folder == "[Gmail]/All Mail" {
+                info!(thread_id, "already in All Mail");
+                return Ok(());
+            }
 
             session
                 .mv(&ids, "[Gmail]/All Mail")
                 .map_err(|e| AgentError::network(format!("IMAP MOVE: {e}")))?;
 
-            info!(thread_id, "archived (moved to All Mail)");
+            info!(thread_id, folder, "archived (moved to All Mail)");
             Ok(())
         })
         .await
@@ -789,11 +844,7 @@ impl GmailExt for GmailAdapter {
         let label = label.to_string();
 
         self.with_session(move |session| {
-            session
-                .select("INBOX")
-                .map_err(|e| AgentError::network(format!("IMAP SELECT: {e}")))?;
-
-            let uids = imap_find_message(session, &thread_id)?;
+            let (_folder, uids) = imap_find_message_in_any_folder(session, &thread_id)?;
             let ids = uid_str(&uids);
 
             session
@@ -810,11 +861,7 @@ impl GmailExt for GmailAdapter {
         let message_id = message_id.to_string();
 
         self.with_session(move |session| {
-            session
-                .select("INBOX")
-                .map_err(|e| AgentError::network(format!("IMAP SELECT: {e}")))?;
-
-            let uids = imap_find_message(session, &message_id)?;
+            let (_folder, uids) = imap_find_message_in_any_folder(session, &message_id)?;
             let ids = uid_str(&uids);
 
             session
@@ -831,11 +878,7 @@ impl GmailExt for GmailAdapter {
         let message_id = message_id.to_string();
 
         self.with_session(move |session| {
-            session
-                .select("INBOX")
-                .map_err(|e| AgentError::network(format!("IMAP SELECT: {e}")))?;
-
-            let uids = imap_find_message(session, &message_id)?;
+            let (_folder, uids) = imap_find_message_in_any_folder(session, &message_id)?;
             let ids = uid_str(&uids);
 
             session
@@ -852,11 +895,7 @@ impl GmailExt for GmailAdapter {
         let message_id = message_id.to_string();
 
         self.with_session(move |session| {
-            session
-                .select("INBOX")
-                .map_err(|e| AgentError::network(format!("IMAP SELECT: {e}")))?;
-
-            let uids = imap_find_message(session, &message_id)?;
+            let (_folder, uids) = imap_find_message_in_any_folder(session, &message_id)?;
             let ids = uid_str(&uids);
 
             session
@@ -873,11 +912,7 @@ impl GmailExt for GmailAdapter {
         let message_id = message_id.to_string();
 
         self.with_session(move |session| {
-            session
-                .select("INBOX")
-                .map_err(|e| AgentError::network(format!("IMAP SELECT: {e}")))?;
-
-            let uids = imap_find_message(session, &message_id)?;
+            let (_folder, uids) = imap_find_message_in_any_folder(session, &message_id)?;
             let ids = uid_str(&uids);
 
             session
@@ -895,12 +930,13 @@ impl GmailExt for GmailAdapter {
         let folder = folder.to_string();
 
         self.with_session(move |session| {
-            session
-                .select("INBOX")
-                .map_err(|e| AgentError::network(format!("IMAP SELECT: {e}")))?;
-
-            let uids = imap_find_message(session, &message_id)?;
+            let (src_folder, uids) = imap_find_message_in_any_folder(session, &message_id)?;
             let ids = uid_str(&uids);
+
+            if src_folder == folder {
+                info!(message_id, folder, "already in target folder");
+                return Ok(());
+            }
 
             session
                 .copy(&ids, &folder)
@@ -914,7 +950,7 @@ impl GmailExt for GmailAdapter {
                 .expunge()
                 .map_err(|e| AgentError::network(format!("IMAP EXPUNGE: {e}")))?;
 
-            info!(message_id, folder, "moved");
+            info!(message_id, src_folder, folder, "moved");
             Ok(())
         })
         .await
@@ -970,11 +1006,7 @@ impl GmailExt for GmailAdapter {
         let save_path = save_path.to_string();
 
         self.with_session(move |session| {
-            session
-                .select("INBOX")
-                .map_err(|e| AgentError::network(format!("IMAP SELECT: {e}")))?;
-
-            let uids = imap_find_message(session, &message_id)?;
+            let (_folder, uids) = imap_find_message_in_any_folder(session, &message_id)?;
             let ids = uid_str(&uids);
 
             let fetches = session
@@ -1092,5 +1124,100 @@ impl GmailExt for GmailAdapter {
             })
         })
         .await
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_folder_default_all_mail() {
+        let (folder, query) = parse_search_folder("hello world");
+        assert_eq!(folder, "[Gmail]/All Mail");
+        assert_eq!(query, "hello world");
+    }
+
+    #[test]
+    fn search_folder_inbox() {
+        let (folder, query) = parse_search_folder("in:inbox FROM john");
+        assert_eq!(folder, "INBOX");
+        assert_eq!(query, "FROM john");
+    }
+
+    #[test]
+    fn search_folder_sent() {
+        let (folder, query) = parse_search_folder("in:sent hello");
+        assert_eq!(folder, "[Gmail]/Sent Mail");
+        assert_eq!(query, "hello");
+    }
+
+    #[test]
+    fn search_folder_drafts() {
+        let (folder, query) = parse_search_folder("in:drafts draft text");
+        assert_eq!(folder, "[Gmail]/Drafts");
+        assert_eq!(query, "draft text");
+    }
+
+    #[test]
+    fn search_folder_only_folder() {
+        let (folder, query) = parse_search_folder("in:starred");
+        assert_eq!(folder, "[Gmail]/Starred");
+        assert_eq!(query, "ALL");
+    }
+
+    #[test]
+    fn search_folder_case_insensitive() {
+        let (folder, _) = parse_search_folder("IN:INBOX test");
+        assert_eq!(folder, "INBOX");
+    }
+
+    #[test]
+    fn search_folder_custom_label() {
+        let (folder, query) = parse_search_folder("in:Work project update");
+        assert_eq!(folder, "work");
+        assert_eq!(query, "project update");
+    }
+
+    #[test]
+    fn search_folder_all_keyword() {
+        let (folder, query) = parse_search_folder("in:all SUBJECT test");
+        assert_eq!(folder, "[Gmail]/All Mail");
+        assert_eq!(query, "SUBJECT test");
+    }
+
+    #[test]
+    fn strip_html_basic() {
+        assert_eq!(strip_html("<p>Hello</p>"), "Hello");
+        assert_eq!(strip_html("<b>bold</b> text"), "bold text");
+        assert_eq!(strip_html("no tags"), "no tags");
+    }
+
+    #[test]
+    fn check_attachments_empty() {
+        let parsed = mailparse::parse_mail(b"Subject: test\r\n\r\nBody")
+            .unwrap_or_else(|_| panic!("parse failed"));
+        assert!(!check_attachments(&parsed));
+    }
+
+    #[test]
+    fn guess_content_type_pdf() {
+        let ct = guess_content_type(Path::new("test.pdf"));
+        assert_eq!(ct, "application/pdf".parse::<ContentType>().unwrap_or(ContentType::TEXT_PLAIN));
+    }
+
+    #[test]
+    fn guess_content_type_txt() {
+        let ct = guess_content_type(Path::new("doc.txt"));
+        let expected = "text/plain".parse::<ContentType>().unwrap_or(ContentType::TEXT_PLAIN);
+        assert_eq!(ct, expected);
+    }
+
+    #[test]
+    fn guess_content_type_unknown_is_octet() {
+        let ct = guess_content_type(Path::new("file.xyz"));
+        let expected = "application/octet-stream".parse::<ContentType>().unwrap_or(ContentType::TEXT_PLAIN);
+        assert_eq!(ct, expected);
     }
 }

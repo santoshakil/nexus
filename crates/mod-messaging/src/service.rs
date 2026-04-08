@@ -113,3 +113,59 @@ fn clamp(val: usize, min: usize, max: usize, default: usize) -> usize {
         val.max(min).min(max)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_not_empty_ok() {
+        assert!(validate_not_empty("hello", "field").is_ok());
+        assert!(validate_not_empty("  x  ", "field").is_ok());
+    }
+
+    #[test]
+    fn validate_not_empty_fails() {
+        assert!(validate_not_empty("", "field").is_err());
+        assert!(validate_not_empty("   ", "field").is_err());
+        assert!(validate_not_empty("\t\n", "field").is_err());
+    }
+
+    #[test]
+    fn clamp_default() {
+        assert_eq!(clamp(0, 1, 100, 20), 20);
+    }
+
+    #[test]
+    fn clamp_within_range() {
+        assert_eq!(clamp(50, 1, 100, 20), 50);
+    }
+
+    #[test]
+    fn clamp_below_min() {
+        assert_eq!(clamp(0, 1, 100, 20), 20);
+    }
+
+    #[test]
+    fn clamp_above_max() {
+        assert_eq!(clamp(500, 1, 100, 20), 100);
+    }
+
+    #[test]
+    fn clamp_at_boundaries() {
+        assert_eq!(clamp(1, 1, 100, 20), 1);
+        assert_eq!(clamp(100, 1, 100, 20), 100);
+    }
+
+    #[test]
+    fn service_no_platforms() {
+        let svc = AgentService::new();
+        assert!(svc.available_platforms().is_empty());
+    }
+
+    #[test]
+    fn service_get_unavailable() {
+        let svc = AgentService::new();
+        assert!(svc.get(Platform::Telegram).is_err());
+    }
+}

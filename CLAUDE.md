@@ -27,7 +27,7 @@ cargo build --workspace
 cargo build --release
 ```
 
-No unit test suite exists yet — only `tests/mcp_protocol_test.sh` (shell-based MCP protocol validation).
+Unit tests: `cargo test --workspace` (58 tests across core-error, core-domain, mod-messaging, infra-google). Shell protocol test: `tests/mcp_protocol_test.sh`.
 
 ## Architecture
 
@@ -76,6 +76,12 @@ app-mcp → mod-messaging → core-domain → core-error
 **Format system:** Every data-returning tool accepts optional `format` param. Compact (default) = one-liners with truncated text (200 chars) for token efficiency. Expanded = one-liners with full untruncated text. Full = raw JSON serialization.
 
 **Error flow:** Adapter returns `AgentError` → `ErrorResponse::from()` → `to_compact()` → `ToolResult::failure()`.
+
+**Rate limiting:** Discord and Slack adapters auto-retry on 429 (up to 3 attempts) with Retry-After header support.
+
+**Gmail search:** Default searches `[Gmail]/All Mail`. Use `in:folder query` syntax (in:inbox, in:sent, in:drafts, in:spam, in:trash, in:starred, in:all). Gmail operations (mark_read, star, move_to, etc.) search across multiple folders to find the message.
+
+**Graceful degradation:** If a platform's auth fails at startup (e.g. Telegram session expired), the server logs a warning and continues with remaining platforms instead of crashing.
 
 ## Workspace lints (enforced)
 

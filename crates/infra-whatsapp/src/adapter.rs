@@ -1,11 +1,12 @@
 use std::path::Path;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use nexus_domain::*;
 use nexus_error::AgentError;
 use reqwest::multipart;
 use serde::Deserialize;
-use tracing::debug;
+use tracing::{debug, warn};
 
 const BASE_URL: &str = "https://graph.facebook.com/v21.0";
 
@@ -40,26 +41,38 @@ impl WhatsAppAdapter {
 
     async fn api_get(&self, url: &str) -> Result<serde_json::Value, AgentError> {
         debug!(url, "whatsapp GET");
-        let resp = self
-            .http
-            .get(url)
-            .header("Authorization", &self.auth)
-            .send()
-            .await
-            .map_err(|e| AgentError::network(format!("whatsapp request failed: {e}")))?;
 
-        let status = resp.status();
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| AgentError::network(format!("whatsapp read body: {e}")))?;
+        for attempt in 0..3 {
+            let resp = self
+                .http
+                .get(url)
+                .header("Authorization", &self.auth)
+                .send()
+                .await
+                .map_err(|e| AgentError::network(format!("whatsapp request failed: {e}")))?;
 
-        if !status.is_success() {
-            return Err(parse_api_error(&body, status.as_u16()));
+            if resp.status().as_u16() == 429 {
+                let delay = parse_wa_retry_after(&resp);
+                warn!(attempt, delay_ms = delay.as_millis() as u64, "whatsapp rate limited, retrying");
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+
+            let status = resp.status();
+            let body = resp
+                .text()
+                .await
+                .map_err(|e| AgentError::network(format!("whatsapp read body: {e}")))?;
+
+            if !status.is_success() {
+                return Err(parse_api_error(&body, status.as_u16()));
+            }
+
+            return serde_json::from_str(&body)
+                .map_err(|e| AgentError::api(format!("whatsapp parse response: {e}")));
         }
 
-        serde_json::from_str(&body)
-            .map_err(|e| AgentError::api(format!("whatsapp parse response: {e}")))
+        Err(AgentError::api("whatsapp rate limited after 3 retries"))
     }
 
     async fn api_post_json(
@@ -68,27 +81,39 @@ impl WhatsAppAdapter {
         json: &serde_json::Value,
     ) -> Result<serde_json::Value, AgentError> {
         debug!(url, "whatsapp POST json");
-        let resp = self
-            .http
-            .post(url)
-            .header("Authorization", &self.auth)
-            .json(json)
-            .send()
-            .await
-            .map_err(|e| AgentError::network(format!("whatsapp request failed: {e}")))?;
 
-        let status = resp.status();
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| AgentError::network(format!("whatsapp read body: {e}")))?;
+        for attempt in 0..3 {
+            let resp = self
+                .http
+                .post(url)
+                .header("Authorization", &self.auth)
+                .json(json)
+                .send()
+                .await
+                .map_err(|e| AgentError::network(format!("whatsapp request failed: {e}")))?;
 
-        if !status.is_success() {
-            return Err(parse_api_error(&body, status.as_u16()));
+            if resp.status().as_u16() == 429 {
+                let delay = parse_wa_retry_after(&resp);
+                warn!(attempt, delay_ms = delay.as_millis() as u64, "whatsapp rate limited, retrying");
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+
+            let status = resp.status();
+            let body = resp
+                .text()
+                .await
+                .map_err(|e| AgentError::network(format!("whatsapp read body: {e}")))?;
+
+            if !status.is_success() {
+                return Err(parse_api_error(&body, status.as_u16()));
+            }
+
+            return serde_json::from_str(&body)
+                .map_err(|e| AgentError::api(format!("whatsapp parse response: {e}")));
         }
 
-        serde_json::from_str(&body)
-            .map_err(|e| AgentError::api(format!("whatsapp parse response: {e}")))
+        Err(AgentError::api("whatsapp rate limited after 3 retries"))
     }
 
     async fn upload_media(
@@ -142,6 +167,16 @@ impl WhatsAppAdapter {
 
         Ok(parsed.id)
     }
+}
+
+fn parse_wa_retry_after(resp: &reqwest::Response) -> Duration {
+    let secs: u64 = resp
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
+    Duration::from_secs(secs.clamp(1, 60))
 }
 
 fn parse_api_error(body: &str, status: u16) -> AgentError {

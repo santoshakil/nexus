@@ -1,9 +1,11 @@
+use std::time::Duration;
+
 use async_trait::async_trait;
 use nexus_domain::*;
 use nexus_error::AgentError;
 use reqwest::Client;
 use serde_json::Value;
-use tracing::debug;
+use tracing::{debug, warn};
 
 const BASE_URL: &str = "https://slack.com/api";
 
@@ -25,29 +27,55 @@ impl SlackAdapter {
     async fn api_post(&self, method: &str, body: &Value) -> Result<Value, AgentError> {
         let url = format!("{BASE_URL}/{method}");
         debug!(url, "slack POST");
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.config.bot_token)
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| AgentError::network(format!("slack request failed: {e}")))?;
-        parse_slack_response(resp).await
+
+        for attempt in 0..3 {
+            let resp = self
+                .client
+                .post(&url)
+                .bearer_auth(&self.config.bot_token)
+                .json(body)
+                .send()
+                .await
+                .map_err(|e| AgentError::network(format!("slack request failed: {e}")))?;
+
+            if resp.status().as_u16() == 429 {
+                let delay = parse_slack_retry_after(&resp);
+                warn!(attempt, delay_ms = delay.as_millis() as u64, "slack rate limited, retrying");
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+
+            return parse_slack_response(resp).await;
+        }
+
+        Err(AgentError::api("slack rate limited after 3 retries"))
     }
 
     async fn api_get(&self, method: &str, params: &[(&str, &str)]) -> Result<Value, AgentError> {
         let url = format!("{BASE_URL}/{method}");
         debug!(url, "slack GET");
-        let resp = self
-            .client
-            .get(&url)
-            .bearer_auth(&self.config.bot_token)
-            .query(params)
-            .send()
-            .await
-            .map_err(|e| AgentError::network(format!("slack request failed: {e}")))?;
-        parse_slack_response(resp).await
+
+        for attempt in 0..3 {
+            let resp = self
+                .client
+                .get(&url)
+                .bearer_auth(&self.config.bot_token)
+                .query(params)
+                .send()
+                .await
+                .map_err(|e| AgentError::network(format!("slack request failed: {e}")))?;
+
+            if resp.status().as_u16() == 429 {
+                let delay = parse_slack_retry_after(&resp);
+                warn!(attempt, delay_ms = delay.as_millis() as u64, "slack rate limited, retrying");
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+
+            return parse_slack_response(resp).await;
+        }
+
+        Err(AgentError::api("slack rate limited after 3 retries"))
     }
 }
 
@@ -313,40 +341,59 @@ impl SlackExt for SlackAdapter {
         let filename = std::path::Path::new(file_path)
             .file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or("file");
+            .unwrap_or("file")
+            .to_string();
 
-        let file_part =
-            reqwest::multipart::Part::bytes(file_content).file_name(filename.to_string());
+        let file_len = file_content.len();
 
-        let mut form = reqwest::multipart::Form::new()
-            .text("channels", channels.join(","))
-            .part("file", file_part);
+        let url_resp = self
+            .api_get(
+                "files.getUploadURLExternal",
+                &[
+                    ("filename", &filename),
+                    ("length", &file_len.to_string()),
+                ],
+            )
+            .await?;
 
-        if let Some(t) = title {
-            form = form.text("title", t.to_string());
-        }
+        let upload_url = url_resp["upload_url"]
+            .as_str()
+            .ok_or_else(|| AgentError::api("slack: no upload_url in response"))?;
+        let file_id = url_resp["file_id"]
+            .as_str()
+            .ok_or_else(|| AgentError::api("slack: no file_id in response"))?
+            .to_string();
 
-        let url = format!("{BASE_URL}/files.upload");
-        debug!(url, file_path, "slack upload file");
-        let resp = self
+        debug!(upload_url, file_id, "slack uploading to presigned URL");
+        let upload_resp = self
             .client
-            .post(&url)
-            .bearer_auth(&self.config.bot_token)
-            .multipart(form)
+            .post(upload_url)
+            .body(file_content)
             .send()
             .await
             .map_err(|e| AgentError::network(format!("slack upload failed: {e}")))?;
-        let resp = parse_slack_response(resp).await?;
 
-        let file_id = resp["file"]["id"].as_str().unwrap_or("unknown");
-        let permalink = resp["file"]["permalink"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
+        if !upload_resp.status().is_success() {
+            let body = upload_resp.text().await.unwrap_or_default();
+            return Err(AgentError::api(format!("slack upload failed: {body}")));
+        }
 
-        Ok(format!(
-            "Uploaded file {filename} (id: {file_id}) {permalink}"
-        ))
+        let mut files_arr = vec![serde_json::json!({"id": file_id})];
+        if let Some(t) = title {
+            files_arr[0]["title"] = serde_json::Value::String(t.to_string());
+        }
+
+        let channel_id = channels.first().map(|s| s.as_str()).unwrap_or("");
+        self.api_post(
+            "files.completeUploadExternal",
+            &serde_json::json!({
+                "files": files_arr,
+                "channel_id": channel_id,
+            }),
+        )
+        .await?;
+
+        Ok(format!("Uploaded file {filename} (id: {file_id})"))
     }
 
     async fn list_users(&self, limit: usize) -> Result<Vec<ChatMember>, AgentError> {
@@ -402,6 +449,75 @@ impl SlackExt for SlackAdapter {
             phone: None,
         })
     }
+
+    async fn edit_message(
+        &self,
+        channel: &str,
+        msg_ts: &str,
+        text: &str,
+    ) -> Result<Message, AgentError> {
+        let resp = self
+            .api_post(
+                "chat.update",
+                &serde_json::json!({
+                    "channel": channel,
+                    "ts": msg_ts,
+                    "text": text,
+                }),
+            )
+            .await?;
+        Ok(parse_slack_message(&resp["message"], channel))
+    }
+
+    async fn delete_message(&self, channel: &str, msg_ts: &str) -> Result<(), AgentError> {
+        self.api_post(
+            "chat.delete",
+            &serde_json::json!({
+                "channel": channel,
+                "ts": msg_ts,
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn read_thread(
+        &self,
+        channel: &str,
+        thread_ts: &str,
+        limit: usize,
+    ) -> Result<Vec<Message>, AgentError> {
+        let limit_s = limit.to_string();
+        let resp = self
+            .api_get(
+                "conversations.replies",
+                &[
+                    ("channel", channel),
+                    ("ts", thread_ts),
+                    ("limit", &limit_s),
+                ],
+            )
+            .await?;
+
+        let messages: Vec<Message> = resp["messages"]
+            .as_array()
+            .map_or(&[] as &[Value], |v| v)
+            .iter()
+            .map(|m| parse_slack_message(m, channel))
+            .collect();
+
+        Ok(messages)
+    }
+}
+
+fn parse_slack_retry_after(resp: &reqwest::Response) -> Duration {
+    let secs: u64 = resp
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    Duration::from_secs(secs.clamp(1, 30))
 }
 
 async fn parse_slack_response(resp: reqwest::Response) -> Result<Value, AgentError> {
